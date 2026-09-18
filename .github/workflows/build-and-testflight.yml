@@ -1,0 +1,79 @@
+name: Build and TestFlight
+
+# Unity（Windows）で書き出した Xcode プロジェクトを zip にして Release に置き、
+# ここ（macOS ランナー）で署名して TestFlight へ上げる（銀髪ハイエルフ麻雀）。
+# 署名は ViewerDUO と同じ「ASC API キー＋自動署名（クラウド管理の配布証明書）」。p12 は使わない。
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "ios-xcode.zip を置いた Release のタグ"
+        required: true
+        default: "xcode"
+      upload_testflight:
+        description: "TestFlightへアップロード"
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  testflight:
+    runs-on: macos-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download Xcode project from Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ inputs.release_tag }}" -p 'ios-xcode.zip' -D dl
+          mkdir xcode
+          tar -xf dl/ios-xcode.zip -C xcode   # bsdtar は zip64 も読める（unzip は 1GB 超で失敗した）
+          ls xcode
+          test -d xcode/Unity-iPhone.xcodeproj
+
+      - name: Install tools
+        run: pip3 install --break-system-packages PyJWT requests
+
+      - name: Set build number and plist flags
+        run: |
+          PB=/usr/libexec/PlistBuddy
+          $PB -c "Set :CFBundleVersion ${{ github.run_number }}" xcode/Info.plist
+          $PB -c "Add :ITSAppUsesNonExemptEncryption bool false" xcode/Info.plist 2>/dev/null || $PB -c "Set :ITSAppUsesNonExemptEncryption false" xcode/Info.plist
+          $PB -c "Print" xcode/Info.plist | grep -E "CFBundle(Version|ShortVersionString|Identifier)|NonExempt"
+
+      - name: Install App Store Connect key
+        env:
+          ASC_API_KEY_CONTENT: ${{ secrets.ASC_API_KEY_CONTENT }}
+        run: |
+          test -n "$ASC_API_KEY_CONTENT"
+          mkdir -p ~/.appstoreconnect/private_keys
+          echo "$ASC_API_KEY_CONTENT" | base64 -D > ~/.appstoreconnect/private_keys/AuthKey_WDXGY9WX55.p8
+
+      - name: Archive
+        run: |
+          set -o pipefail
+          mkdir -p build
+          xcodebuild archive             -project xcode/Unity-iPhone.xcodeproj             -scheme Unity-iPhone             -configuration Release             -destination "generic/platform=iOS"             -archivePath build/HighElfMahjong.xcarchive             CODE_SIGN_STYLE=Automatic             CODE_SIGN_IDENTITY="Apple Development"             PROVISIONING_PROFILE_SPECIFIER=""             PROVISIONING_PROFILE_SPECIFIER_APP=""             DEVELOPMENT_TEAM=83VGKGSQUH             -allowProvisioningUpdates             -authenticationKeyPath ~/.appstoreconnect/private_keys/AuthKey_WDXGY9WX55.p8             -authenticationKeyID WDXGY9WX55             -authenticationKeyIssuerID 2be0734f-943a-4d61-9dc9-5d9045c46fec             > build/archive.log 2>&1 || { grep -E "error:|\*\* " build/archive.log | tail -60; exit 1; }
+          grep -E "warning: .*sign|ARCHIVE SUCCEEDED" build/archive.log | tail -5
+
+      - name: Upload archive log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-log
+          path: build/archive.log
+          if-no-files-found: ignore
+
+      - name: Export and upload to TestFlight
+        if: inputs.upload_testflight
+        run: |
+          xcodebuild -exportArchive \
+            -archivePath build/HighElfMahjong.xcarchive \
+            -exportPath build/export \
+            -exportOptionsPlist export_options.plist \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath ~/.appstoreconnect/private_keys/AuthKey_WDXGY9WX55.p8 \
+            -authenticationKeyID WDXGY9WX55 \
+            -authenticationKeyIssuerID 2be0734f-943a-4d61-9dc9-5d9045c46fec
